@@ -8,6 +8,7 @@ from typing import Any, Dict, List, Mapping, Optional, Tuple, Type
 import torch
 
 from unirl.types.conditions import Condition
+from unirl.types.loss_agg import parse_loss_agg_mode
 from unirl.types.segments.text import TextSegment
 
 from .base import (
@@ -15,10 +16,12 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     _prepare_ar_logp_anchor,
+    aggregate_token_losses,
     rollout_replay_logp_absdiff,
+    select_active_tokens,
     typed_conditions,
 )
-from .grpo import GRPO, aggregate_token_losses
+from .grpo import GRPO
 
 
 @dataclass
@@ -93,6 +96,7 @@ def _cppo_loss(
     delta: float,
     w_min: float,
     delta_b: float,
+    mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """CPPO per-token loss over packed-varlen ``[total_tokens]`` (paper Eq. 8-11; Binary-TV hard mask)."""
     log_diff = torch.clamp(new_logp - old_logp, min=-20.0, max=20.0)
@@ -112,6 +116,7 @@ def _cppo_loss(
         )
 
     pg_losses = -adv * ratio * keep
+    ratio, log_diff, keep = select_active_tokens(mask, ratio, log_diff, keep)
     metrics = {
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
@@ -159,7 +164,7 @@ class CPPO(StageAlgorithm):
             raise ValueError(f"CPPO: cppo_w_min must be in (0, 1]; got {self.cppo_w_min}")
         if self.cppo_delta_b < 0.0:
             raise ValueError(f"CPPO: cppo_delta_b must be >= 0; got {self.cppo_delta_b}")
-        self.loss_agg_mode = str(loss_agg_mode)
+        self.loss_agg_mode = parse_loss_agg_mode(loss_agg_mode, owner="CPPO").value
         self.horizon = int(horizon)
         if sampling_temperature is None:
             from unirl.types.sampling import ARSamplingParams
@@ -218,6 +223,7 @@ class CPPO(StageAlgorithm):
             delta=self.cppo_delta,
             w_min=self.cppo_w_min,
             delta_b=self.cppo_delta_b,
+            mask=segment.loss_mask,
         )
 
         loss = aggregate_token_losses(
@@ -235,7 +241,7 @@ class CPPO(StageAlgorithm):
         metrics: Dict[str, Any] = {
             "policy_loss": float(loss.detach().item()),
             "cppo_delta": self.cppo_delta,
-            **rollout_replay_logp_absdiff(new_logp, rollout_logp),
+            **rollout_replay_logp_absdiff(new_logp, rollout_logp, segment.loss_mask),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
         return AlgorithmStepResult(

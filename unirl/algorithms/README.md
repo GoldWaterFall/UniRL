@@ -91,6 +91,21 @@ segment, expand advantages per token), keeping `supports_multi_update = False`.
 - **AR `loss_mask` is in the reduction denominator** — `aggregate_token_losses`
   (GRPO, DRPO, CPPO, DPPO) divides by the active mask weight, not the packed
   length. `seq-mean-token-mean` is a first-class mode, not a silent `token-mean`.
+  A fully-masked sequence contributes 0 but **stays in the sequence-mean denominator**
+  (verl `agg_loss` with a fixed `global_batch_size`; `PPO._aggregate_token_loss`; GSPO's
+  per-sequence mean; SFT's training loss). Dropping it would renormalize per micro and
+  break the sample-share micro weighting that token-budget packing relies on for grouping
+  invariance. SFT's `evaluate_loss` weight is the exception: eval reduces `Σsum / Σweight`
+  globally, so DP pad rows must stay *out* of it.
+- **`loss_agg_mode` values live in `unirl.types.loss_agg.LossAggMode`** (stdlib-only and below
+  `algorithms`/`train`/`config` in the dependency order, so recipe checks can import it without torch). GRPO/DRPO/CPPO/DPPO/PPO/SFT reject unknown values at `__init__`.
+  The mode alone decides micro weighting in `TrainStack._resolve_loss_scales`: `token-mean`
+  micros are weighted by their share of the step's valid tokens (all-reduced over DP), so the
+  step loss is the global token mean (verl `agg_loss` with `batch_num_tokens`); every other
+  mode, and every algorithm without a `loss_agg_mode` (GSPO, diffusion, `FlowMatchSFT`), is
+  weighted by sample share. Both are grouping-invariant, so `TokenBudgetPlanner` packing and
+  `micro_batch_size` never change the gradient. `UnifiedModelTrainStack` still weights by
+  sample share only.
 - **AR `sampling_temperature` must equal the rollout `sampling.temperature`** —
   `ARStage.replay` rescales logits by it (`log_softmax(logits / T)`) to match SGLang's
   distribution; when unset it silently falls back to the `ARSamplingParams` default,

@@ -8,6 +8,7 @@ from typing import Any, Dict, Mapping, Optional, Tuple, Type
 import torch
 
 from unirl.types.conditions import Condition
+from unirl.types.loss_agg import parse_loss_agg_mode
 from unirl.types.segments.text import TextSegment
 
 from .base import (
@@ -15,10 +16,12 @@ from .base import (
     BaseAlgorithmConfig,
     StageAlgorithm,
     _prepare_ar_logp_anchor,
+    aggregate_token_losses,
     rollout_replay_logp_absdiff,
+    select_active_tokens,
     typed_conditions,
 )
-from .grpo import GRPO, aggregate_token_losses
+from .grpo import GRPO
 
 
 @dataclass
@@ -42,6 +45,7 @@ def _drpo_loss(
     advantages: torch.Tensor,
     epsilon: float,
     mu_weighted: bool = True,
+    mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
     """DRPO per-token loss over packed-varlen ``[total_tokens]`` (paper §3; gradient Eq 9, weight Table 1)."""
     log_diff = torch.clamp(new_logp - old_logp, min=-20.0, max=20.0)
@@ -58,6 +62,9 @@ def _drpo_loss(
         adaptive_eps = torch.full_like(old_prob, epsilon)
     quadratic_penalty = adv.abs() * penalty_weight * ratio_delta.square() / (2.0 * epsilon)
     pg_losses = -adv * ratio + quadratic_penalty
+    ratio, log_diff, quadratic_penalty, adaptive_eps = select_active_tokens(
+        mask, ratio, log_diff, quadratic_penalty, adaptive_eps
+    )
     metrics = {
         "ratio_mean": ratio.mean().detach(),
         "ratio_max": ratio.max().detach(),
@@ -97,7 +104,7 @@ class DRPO(StageAlgorithm):
         self.stage = getattr(pipeline, stage_attr)
         self.drpo_epsilon = float(drpo_epsilon)
         self.penalty_mu_weighted = bool(penalty_mu_weighted)
-        self.loss_agg_mode = str(loss_agg_mode)
+        self.loss_agg_mode = parse_loss_agg_mode(loss_agg_mode, owner="DRPO").value
         self.horizon = int(horizon)
         if sampling_temperature is None:
             from unirl.types.sampling import ARSamplingParams
@@ -154,6 +161,7 @@ class DRPO(StageAlgorithm):
             advantages=adv_per_token,
             epsilon=self.drpo_epsilon,
             mu_weighted=self.penalty_mu_weighted,
+            mask=segment.loss_mask,
         )
 
         loss = aggregate_token_losses(
@@ -171,7 +179,7 @@ class DRPO(StageAlgorithm):
         metrics: Dict[str, Any] = {
             "policy_loss": float(loss.detach().item()),
             "drpo_epsilon": self.drpo_epsilon,
-            **rollout_replay_logp_absdiff(new_logp, rollout_logp),
+            **rollout_replay_logp_absdiff(new_logp, rollout_logp, segment.loss_mask),
             **{k: float(v.item()) for k, v in ratio_metrics.items()},
         }
         return AlgorithmStepResult(
